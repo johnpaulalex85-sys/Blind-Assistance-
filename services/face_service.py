@@ -114,10 +114,8 @@ class FaceService:
 
             confidence = round(float(best_sim), 3) if best_sim != -1.0 else 0.0
             if best_sim < threshold:
-                best_match = f"Person {len(self.database) + 1}"
-                self.database[best_match] = face.embedding
-                self.save_database()
-                logger.info(f"Auto-registered new face as {best_match}")
+                best_match = "unknown person"
+                logger.debug(f"Unrecognized face detected.")
 
             bbox = [int(x) for x in face.bbox]
             results.append({

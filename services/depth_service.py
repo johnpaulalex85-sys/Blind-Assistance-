@@ -89,9 +89,21 @@ class DepthService:
                     # Cap distance to reasonable bounds, e.g., 0.1 to 20 meters
                     estimated_distance = max(0.1, min(estimated_distance, 20.0))
                     
+                    # Assign a relative depth category (Note: these are uncalibrated pseudo-meters)
+                    if estimated_distance < 1.0:
+                        category = "VERY_CLOSE"
+                    elif estimated_distance < 2.5:
+                        category = "CLOSE"
+                    elif estimated_distance < 5.0:
+                        category = "MEDIUM"
+                    else:
+                        category = "FAR"
+                        
                     distances.append({
                         "object": det.get("class_name", "unknown"),
-                        "distance": f"{estimated_distance:.1f} meters",
+                        "distance": f"{category} (approx {estimated_distance:.1f}m)",
+                        "distance_val": round(estimated_distance, 2),
+                        "distance_category": category,
                         "box": box
                     })
 

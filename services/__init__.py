@@ -35,3 +35,9 @@ def get_depth_service():
 
 def get_describe_service():
     return services_state.get("describe_service")
+
+def get_gemini_service():
+    if "gemini_service" not in services_state or services_state["gemini_service"] is None:
+        from .gemini_service import GeminiService
+        services_state["gemini_service"] = GeminiService()
+    return services_state.get("gemini_service")

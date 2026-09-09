@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Vision Assistant Live</title>
+    <title>FRIDAY</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600&display=swap" rel="stylesheet">
@@ -206,7 +206,7 @@
 <body>
 
     <header>
-        <h1>Vision Assistant</h1>
+        <h1>FRIDAY</h1>
         <p style="color: var(--text-muted); margin-top: 0.5rem; font-size: 0.9rem;">Mobile Camera Feed via WebSockets</p>
     </header>
 
@@ -228,7 +228,12 @@
             <button onclick="testAudio()" style="background: #3b82f6; box-shadow: 0 4px 15px rgba(59, 130, 246, 0.3);">Test Audio</button>
             <button id="voice-toggle-btn" onclick="toggleVoiceCommands()" style="background: #f59e0b; box-shadow: 0 4px 15px rgba(245, 158, 11, 0.3);">Enable Voice Commands</button>
 
-            <h3 style="margin: 0; color: #e2e8f0; font-size: 1.1rem;">Detection Log</h3>
+            <div style="display: flex; justify-content: space-between; margin-top: 1rem; color: #94a3b8; font-size: 0.9rem;">
+                <span id="latency-display">Latency: -- ms</span>
+                <span id="mode-display">Mode: --</span>
+            </div>
+
+            <h3 style="margin: 0; color: #e2e8f0; font-size: 1.1rem; margin-top: 1rem;">Detection Log</h3>
             <div class="log-area" id="log-area">
                 <div class="log-entry"><span class="time">System</span> Awaiting camera permissions...</div>
             </div>
@@ -297,6 +302,16 @@
                 if (data.depth_map) {
                     const depthImg = document.getElementById('depth-map-image');
                     depthImg.src = 'data:image/jpeg;base64,' + data.depth_map;
+                }
+                
+                document.getElementById('latency-display').innerText = `Latency: ${data.latency_ms} ms`;
+                document.getElementById('mode-display').innerText = `Mode: ${data.mode}`;
+                
+                if (data.speech && data.speech.length > 0) {
+                    for (let text of data.speech) {
+                        addLog(`FRIDAY: ${text}`);
+                        speakAcknowledge(text);
+                    }
                 }
                 
                 drawDetections(data.detections, data.distance);
@@ -536,29 +551,19 @@
                 document.getElementById('voice-toggle-btn').style.background = '#ef4444';
             };
             
-            rec.onresult = (event) => {
+            rec.onresult = async (event) => {
                 const transcript = event.results[event.results.length - 1][0].transcript.toLowerCase();
                 addLog(`Heard: "${transcript}"`);
                 
-                if (transcript.includes("disable voice commands") || transcript.includes("stop listening")) {
-                    speakAcknowledge("Disabling voice commands");
-                    toggleVoiceCommands();
-                } else if (transcript.includes("disable audio") || transcript.includes("disable the audio") || transcript.includes("mute")) {
-                    isAudioMuted = true;
-                    addLog("Audio output disabled by voice command.");
-                } else if (transcript.includes("enable audio") || transcript.includes("enable the audio") || transcript.includes("unmute")) {
-                    isAudioMuted = false;
-                    addLog("Audio output enabled by voice command.");
-                    speakAcknowledge("Audio enabled");
-                } else if (transcript.includes("analyze") || transcript.includes("analyse") || transcript.includes("describe") || transcript.includes("what is around") || transcript.includes("who is")) {
-                    speakAcknowledge("Analyzing scene");
-                    refreshAndAnalyze();
-                } else if (transcript.includes("register face") || transcript.includes("add face")) {
-                    speakAcknowledge("Registering face");
-                    startFaceScan();
-                } else if (transcript.includes("test audio")) {
-                    speakAcknowledge("Testing audio");
-                    testAudio();
+                // Send natural language query to the Assistant Brain
+                try {
+                    await fetch('/api/query', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ text: transcript })
+                    });
+                } catch (err) {
+                    addLog(`Query failed: ${err.message}`);
                 }
             };
             

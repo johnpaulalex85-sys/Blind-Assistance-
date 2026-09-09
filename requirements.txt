@@ -17,3 +17,5 @@ python-multipart>=0.0.9
 websockets>=12.01
 qwen-vl-utils
 accelerate
+filterpy>=1.4.5
+scipy>=1.10.1

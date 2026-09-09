@@ -7,10 +7,13 @@ from fastapi import FastAPI, Response, status, WebSocket, WebSocketDisconnect, U
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from config import settings
-from audio import tts_manager
-from services import init_services, get_yolo_detector, get_ocr_service, get_face_service, get_depth_service, get_describe_service
-from utils.scene_builder import build_scene_json
-import json
+from audio.tts import tts_manager
+from services import init_services, get_face_service
+from perception.perception_manager import get_perception_manager
+from intelligence.assistant import get_assistant_brain
+from scene.scene_state import SceneState, TrackedObject, DetectedFace, DetectedText
+import time
+from pydantic import BaseModel
 
 # Configure Logging
 logging.basicConfig(
@@ -19,33 +22,25 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Global state to hold the latest frame and scene data for description generation
-latest_state = {
-    "frame": None,
-    "scene_json": None
-}
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
     logger.info(f"Starting {settings.PROJECT_NAME} version {settings.VERSION}")
     
-    # Initialize AI models/services
     init_services()
-    
-    # Start the audio TTS thread
     tts_manager.start()
-        
-    yield  # Hand over control to FastAPI to serve requests
     
-    # Shutdown
+    get_perception_manager()
+    get_assistant_brain()
+        
+    yield 
+    
     logger.info("Shutting down services...")
     tts_manager.stop()
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
     version=settings.VERSION,
-    description="AI-powered assistant for visually impaired people",
+    description="FRIDAY-like AI-powered assistant",
     lifespan=lifespan,
 )
 
@@ -57,180 +52,138 @@ def read_root():
 
 @app.websocket("/ws/detect")
 async def websocket_detect(websocket: WebSocket):
-    """WebSocket endpoint to receive frames from client and return YOLO, OCR detections, and depth map."""
     await websocket.accept()
-    yolo_detector = get_yolo_detector()
-    ocr_service = get_ocr_service()
-    face_service = get_face_service()
-    depth_service = get_depth_service()
+    perception = get_perception_manager()
+    brain = get_assistant_brain()
     
     try:
         while True:
-            # Receive image frame as bytes
             data = await websocket.receive_bytes()
             
-            if yolo_detector is None:
-                await websocket.send_json({"detections": []})
-                continue
-                
-            # Decode the image bytes into a cv2 frame
             nparr = np.frombuffer(data, np.uint8)
             frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
             
             if frame is None:
                 continue
                 
-            # Run YOLO, OCR, and Face Recognition concurrently in threadpools
-            async def run_ocr():
-                if ocr_service is None:
-                    return {"texts": []}
-                return await asyncio.to_thread(ocr_service.detect_text, frame, 0.5)
-                
-            async def run_face():
-                if face_service is None:
-                    return {"faces": []}
-                return await asyncio.to_thread(face_service.recognize_face, frame, 0.6)
-
-            yolo_task = asyncio.to_thread(yolo_detector.detect, frame, 0.4)
-            ocr_task = run_ocr()
-            face_task = run_face()
+            t0 = time.time()
+            obs = await perception.analyze_frame(frame)
+            latency = (time.time() - t0) * 1000
             
-            detections, ocr_data, face_data = await asyncio.gather(yolo_task, ocr_task, face_task)
+            if not obs:
+                continue
+                
+            tracked_objs = [
+                TrackedObject(o["track_id"], o["class_name"], o["box"], "UNKNOWN", 0.0) 
+                for o in obs["objects"]
+            ]
+            for d in obs["distances"]:
+                # mapping by class for demo purposes
+                for o in tracked_objs:
+                    if o.class_name == d["object"]:
+                        o.distance_category = d["distance_category"]
+                        o.distance_val = d["distance_val"]
+                        
+            faces = [DetectedFace(f["name"], f["box"], f["confidence"]) for f in obs["faces"]]
+            texts = [DetectedText(t["text"], t["box"]) for t in obs["texts"]]
             
-            # Save original YOLO detections for the Scene Builder before appending other data
-            yolo_raw = list(detections)
-            
-            # Format OCR results to match YOLO detections format for the frontend
-            for item in ocr_data.get("texts", []):
-                # OCR bbox is [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
-                bbox = item["bbox"]
-                xs = [pt[0] for pt in bbox]
-                ys = [pt[1] for pt in bbox]
-                x1, x2 = min(xs), max(xs)
-                y1, y2 = min(ys), max(ys)
-                
-                detections.append({
-                    "box": [x1, y1, x2, y2],
-                    "confidence": item["confidence"],
-                    "class_name": f'"{item["text"]}"'
-                })
-                
-            # Format Face results to match YOLO detections format for the frontend
-            for item in face_data.get("faces", []):
-                detections.append({
-                    "box": item["box"],
-                    "confidence": item["confidence"],
-                    "class_name": f'Face: {item["name"]}'
-                })
-                
-            # Run depth estimation using the final detections list to calculate distances
-            distance_data = []
-            depth_map = None
-            if depth_service is not None:
-                distance_data, depth_map = await asyncio.to_thread(depth_service.estimate_depth, frame, detections)
-                
-            # Build structured scene JSON using the modular scene builder
-            scene_json = build_scene_json(
-                yolo_raw,
-                ocr_data, 
-                face_data, 
-                distance_data
+            # Correlate faces to person objects
+            for face in faces:
+                fx1, fy1, fx2, fy2 = face.box
+                fcx, fcy = (fx1 + fx2) / 2, (fy1 + fy2) / 2
+                for obj in tracked_objs:
+                    if obj.class_name == "person":
+                        ox1, oy1, ox2, oy2 = obj.box
+                        if ox1 <= fcx <= ox2 and oy1 <= fcy <= oy2:
+                            obj.class_name = face.name
+                            break
+                            
+            state = SceneState(
+                timestamp=obs["timestamp"],
+                objects=tracked_objs,
+                faces=faces,
+                texts=texts,
+                raw_observation={"frame": frame, "scene_json": obs}
             )
             
-            # Store in global state for the Qwen endpoint
-            latest_state["frame"] = frame.copy()
-            latest_state["scene_json"] = scene_json
+            brain.process_new_scene(state)
             
-            # Send results back to the client browser
-            await websocket.send_json({
-                "detections": detections,
-                "distance": distance_data,
-                "depth_map": depth_map
-            })
+            frontend_detections = []
+            for o in tracked_objs:
+                frontend_detections.append({
+                    "box": o.box,
+                    "confidence": 1.0,
+                    "class_name": f"[{o.track_id}] {o.class_name}"
+                })
+            for t in obs["texts"]:
+                bbox = t["bbox"]
+                xs = [pt[0] for pt in bbox]
+                ys = [pt[1] for pt in bbox]
+                frontend_detections.append({
+                    "box": [min(xs), min(ys), max(xs), max(ys)],
+                    "confidence": t["confidence"],
+                    "class_name": f'text: "{t["text"]}"'
+                })
+            for f in obs["faces"]:
+                frontend_detections.append({
+                    "box": f["box"],
+                    "confidence": f["confidence"],
+                    "class_name": f'face: {f["name"]}'
+                })
+                
+            frontend_distances = obs["distances"]
+            speech_msgs = brain.response.get_pending_messages()
 
+            await websocket.send_json({
+                "detections": frontend_detections,
+                "distance": frontend_distances,
+                "depth_map": obs["depth_map_base64"],
+                "latency_ms": round(latency, 1),
+                "mode": settings.ASSISTANT_MODE,
+                "speech": speech_msgs
+            })
             
     except WebSocketDisconnect:
         logger.info("Client disconnected from WebSocket")
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
 
-@app.get("/audio/speak")
-def speak_text(text: str = "Hello, I am your vision assistant."):
-    """Test endpoint for Text-to-Speech."""
-    tts_manager.speak(text)
-    return {"status": "speaking", "text": text}
+class VoiceQuery(BaseModel):
+    text: str
+
+@app.post("/api/query")
+async def assistant_query(query: VoiceQuery):
+    brain = get_assistant_brain()
+    
+    # Immediately interrupt any ongoing speech before processing
+    brain.audio_tools.interrupt()
+    
+    import threading
+    threading.Thread(target=brain.process_user_query, args=(query.text,)).start()
+    return {"success": True, "message": "Query received"}
 
 @app.get("/api/describe_scene")
 async def describe_scene_api():
-    """Endpoint to generate a description of the current scene."""
-    describe_service = get_describe_service()
-    if describe_service is None:
-        return {"description": "Describe service not initialized.", "error": True}
-        
-    frame = latest_state.get("frame")
-    scene_json = latest_state.get("scene_json")
+    brain = get_assistant_brain()
+    state = brain.scene_memory.get_latest_state()
     
-    if frame is None or scene_json is None:
-        return {"description": "No active camera feed or scene data.", "error": True}
+    if not state or not state.raw_observation:
+        return {"success": True, "description": "I don't have enough visual context right now."}
         
-    try:
-        # Run Rule-based describe in a threadpool (or direct, it's instant)
-        description = describe_service.generate_description(frame, scene_json)
+    frame = state.raw_observation.get("frame")
+    scene_json = state.raw_observation.get("scene_json")
+    
+    if frame is None or not scene_json:
+        return {"success": True, "description": "I can't see the scene clearly."}
         
-        # Speak the description automatically
-        tts_manager.speak(description)
-        
-        return {"description": description, "success": True}
-    except Exception as e:
-        logger.error(f"Describe scene API error: {e}")
-        return {"description": str(e), "error": True}
-
-@app.post("/api/ocr")
-async def detect_text_api(file: UploadFile = File(...)):
-    """API endpoint to receive an image and return text detections."""
-    ocr_service = get_ocr_service()
-    if ocr_service is None:
-        return {"texts": [], "error": "OCR service not initialized"}
-        
-    try:
-        data = await file.read()
-        nparr = np.frombuffer(data, np.uint8)
-        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        
-        if frame is None:
-            return {"texts": [], "error": "Failed to decode image"}
-            
-        # Run OCR in a threadpool to avoid blocking
-        result = await asyncio.to_thread(ocr_service.detect_text, frame, 0.5)
-        return result
-    except Exception as e:
-        logger.error(f"OCR API error: {e}")
-        return {"texts": [], "error": str(e)}
-
-@app.post("/api/register_face")
-async def register_face_api(name: str = Form(...), file: UploadFile = File(...)):
-    """API endpoint to register a new face."""
-    face_service = get_face_service()
-    if face_service is None:
-        return {"success": False, "message": "Face service not initialized"}
-        
-    try:
-        data = await file.read()
-        nparr = np.frombuffer(data, np.uint8)
-        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        
-        if frame is None:
-            return {"success": False, "message": "Failed to decode image"}
-            
-        success, message = await asyncio.to_thread(face_service.register_face, name, frame)
-        return {"success": success, "message": message}
-    except Exception as e:
-        logger.error(f"Face registration API error: {e}")
-        return {"success": False, "message": str(e)}
+    description = await asyncio.to_thread(
+        brain.vision_tools.describe_scene_complex, frame, scene_json
+    )
+    
+    return {"success": True, "description": description}
 
 @app.post("/api/register_face_multi")
 async def register_face_multi_api(name: str = Form(...), files: list[UploadFile] = File(...)):
-    """API endpoint to register a new face with multiple angles."""
     face_service = get_face_service()
     if face_service is None:
         return {"success": False, "message": "Face service not initialized"}

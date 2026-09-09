@@ -112,3 +112,72 @@ class QwenService:
         except Exception as e:
             logger.error(f"Qwen generation error: {e}")
             return "An error occurred while generating the description."
+
+    def answer_question(self, question: str, frame: np.ndarray, scene_json: dict) -> str:
+        """
+        Answers a specific user question using Qwen2-VL based on the frame and scene data.
+        """
+        if self.model is None or self.processor is None:
+            return "Vision Language Model is not initialized."
+            
+        try:
+            if isinstance(frame, np.ndarray):
+                import cv2
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                pil_image = Image.fromarray(rgb_frame)
+            else:
+                pil_image = frame
+
+            # Remove large binary/base64 data from the context to avoid token limits
+            clean_scene = {k: v for k, v in scene_json.items() if k != "depth_map_base64"}
+
+            prompt = (
+                "You are FRIDAY, a highly intelligent and helpful AI assistant for a visually impaired user.\n"
+                f"The user is asking: '{question}'\n\n"
+                "Answer the user's question directly, conversationally, and concisely (under 50 words).\n"
+                "Use the provided image and scene data to inform your answer if the question relates to the environment.\n\n"
+                f"Scene Data Context:\n{json.dumps(clean_scene, indent=2)}"
+            )
+
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": pil_image},
+                        {"type": "text", "text": prompt},
+                    ],
+                }
+            ]
+
+            text = self.processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            
+            image_inputs, video_inputs = process_vision_info(messages)
+            
+            inputs = self.processor(
+                text=[text],
+                images=image_inputs,
+                videos=video_inputs,
+                padding=True,
+                return_tensors="pt",
+            )
+            
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            inputs = inputs.to(device)
+
+            generated_ids = self.model.generate(**inputs, max_new_tokens=100)
+            
+            generated_ids_trimmed = [
+                out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+            ]
+            
+            output_text = self.processor.batch_decode(
+                generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+            )
+            
+            return output_text[0].strip()
+            
+        except Exception as e:
+            logger.error(f"Qwen Q&A error: {e}")
+            return "I'm sorry, I encountered an error while trying to think."
